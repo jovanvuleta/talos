@@ -19,6 +19,10 @@ import (
 	"github.com/siderolabs/go-retry/retry"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/suite"
+	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
+	"go.uber.org/zap/zaptest"
+	"go.uber.org/zap/zaptest/observer"
 	"golang.org/x/sys/unix"
 
 	"github.com/siderolabs/talos/internal/app/machined/pkg/controllers/ctest"
@@ -29,6 +33,8 @@ import (
 
 type RouteSpecSuite struct {
 	ctest.DefaultSuite
+
+	observedLogs *observer.ObservedLogs
 }
 
 func (suite *RouteSpecSuite) uniqueDummyInterface() string {
@@ -1159,6 +1165,11 @@ func (suite *RouteSpecSuite) TestForeignRouteUntouched() {
 
 	suite.Assert().Zero(stop(), "foreign route was deleted")
 
+	// the conflict with the foreign route is not a controller failure, as retrying can't resolve it
+	for _, entry := range suite.observedLogs.FilterMessage("controller failed").All() {
+		suite.Assert().NotContains(fmt.Sprint(entry.ContextMap()["error"]), "Table:206")
+	}
+
 	suite.Require().NoError(suite.assertMultipathRoute(nethelpers.FamilyInet4, destination, table, route.TypedSpec().Priority, func(message rtnetlink.RouteMessage) error {
 		if !message.Attributes.Gateway.Equal(foreignGateway.AsSlice()) {
 			return fmt.Errorf("expected foreign gateway %s, got %s", foreignGateway, message.Attributes.Gateway)
@@ -1179,6 +1190,90 @@ func (suite *RouteSpecSuite) TestForeignRouteUntouched() {
 }
 
 // TestTeardownByKey verifies that the route is removed on teardown even if its next-hops are not the ones in the spec.
+// TestForeignRouteRemoved verifies that the spec route is installed once a foreign route with the same key goes away.
+func (suite *RouteSpecSuite) TestForeignRouteRemoved() {
+	conn, err := rtnetlink.Dial(nil)
+	suite.Require().NoError(err)
+
+	defer conn.Close() //nolint:errcheck
+
+	ifaceIndex := suite.createDummyInterface(conn, suite.uniqueDummyInterface(), netip.MustParsePrefix("192.0.2.1/24"))
+	defer conn.Link.Delete(ifaceIndex) //nolint:errcheck
+
+	destination := netip.MustParsePrefix("10.97.0.0/16")
+	table := nethelpers.RoutingTable(207)
+	priority := ifaceIndex
+	foreignGateway := netip.MustParseAddr("192.0.2.2")
+	gateway := netip.MustParseAddr("192.0.2.3")
+
+	foreignRoute := &rtnetlink.RouteMessage{
+		Family:    unix.AF_INET,
+		DstLength: uint8(destination.Bits()),
+		Protocol:  uint8(nethelpers.ProtocolRA),
+		Scope:     uint8(nethelpers.ScopeGlobal),
+		Type:      uint8(nethelpers.TypeUnicast),
+		Attributes: rtnetlink.RouteAttributes{
+			Dst:      destination.Addr().AsSlice(),
+			Gateway:  foreignGateway.AsSlice(),
+			OutIface: ifaceIndex,
+			Priority: priority,
+			Table:    uint32(table),
+		},
+	}
+
+	suite.Require().NoError(conn.Route.Add(foreignRoute))
+
+	route := network.NewRouteSpec(network.NamespaceName, network.RouteID(table, nethelpers.FamilyInet4, destination, priority))
+	*route.TypedSpec() = network.RouteSpecSpec{
+		Family:      nethelpers.FamilyInet4,
+		Destination: destination,
+		Gateway:     gateway,
+		Table:       table,
+		Priority:    priority,
+		Protocol:    nethelpers.ProtocolStatic,
+		Type:        nethelpers.TypeUnicast,
+		Scope:       nethelpers.ScopeGlobal,
+		ConfigLayer: network.ConfigMachineConfiguration,
+	}
+
+	suite.Create(route)
+
+	// wait for the controller to skip the route because of the foreign one
+	suite.AssertWithin(5*time.Second, 50*time.Millisecond, func() error {
+		for _, entry := range suite.observedLogs.FilterMessage("route with the same key already exists, skipping").All() {
+			if entry.ContextMap()["destination"] == destination.String() {
+				return nil
+			}
+		}
+
+		return retry.ExpectedErrorf("route to %s was not skipped yet", destination)
+	})
+
+	// the foreign route goes away (e.g. it expires), so the spec route should be installed
+	suite.Require().NoError(conn.Route.Delete(foreignRoute))
+
+	suite.AssertWithin(5*time.Second, 50*time.Millisecond, func() error {
+		return suite.assertMultipathRoute(nethelpers.FamilyInet4, destination, table, priority, func(message rtnetlink.RouteMessage) error {
+			if !message.Attributes.Gateway.Equal(gateway.AsSlice()) {
+				return fmt.Errorf("expected gateway %s, got %s", gateway, message.Attributes.Gateway)
+			}
+
+			if message.Protocol != uint8(nethelpers.ProtocolStatic) {
+				return fmt.Errorf("expected protocol %s, got %d", nethelpers.ProtocolStatic, message.Protocol)
+			}
+
+			return nil
+		})
+	})
+
+	// the route is owned by the spec now, so it is removed on teardown
+	suite.Require().NoError(suite.State().TeardownAndDestroy(suite.Ctx(), route.Metadata()))
+
+	suite.AssertWithin(5*time.Second, 50*time.Millisecond, func() error {
+		return suite.assertNoRouteInTable(nethelpers.FamilyInet4, destination, table, priority)
+	})
+}
+
 func (suite *RouteSpecSuite) TestTeardownByKey() {
 	conn, err := rtnetlink.Dial(nil)
 	suite.Require().NoError(err)
@@ -1366,8 +1461,13 @@ func TestRouteSpecSuite(t *testing.T) {
 		t.Skip("requires root")
 	}
 
+	observerCore, observedLogs := observer.New(zap.DebugLevel)
+	logger := zap.New(zapcore.NewTee(zaptest.NewLogger(t).Core(), observerCore))
+
 	suite.Run(t, &RouteSpecSuite{
-		Timeout: 15 * time.Second,
+		observedLogs: observedLogs,
+		Logger:       logger,
+		Timeout:      15 * time.Second,
 		AfterSetup: func(suite *ctest.DefaultSuite) {
 			suite.Require().NoError(suite.Runtime().RegisterController(&netctrl.RouteSpecController{}))
 		},

@@ -6,8 +6,10 @@ package network
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/netip"
+	"os"
 	"slices"
 
 	"github.com/cosi-project/runtime/pkg/controller"
@@ -637,6 +639,22 @@ func (ctrl *RouteSpecController) syncRoute(ctx context.Context, r controller.Run
 		}
 
 		if err := conn.Route.Add(msg); err != nil {
+			if errors.Is(err, os.ErrExist) {
+				// a route with the same key created by someone else (not owned by this spec) is already in the kernel,
+				// retrying won't help, so don't fail the controller
+				logger.Info(
+					"route with the same key already exists, skipping",
+					zap.String("destination", destinationStr),
+					zap.String("gateway", gatewayStr),
+					zap.Stringer("table", route.TypedSpec().Table),
+					zap.String("link", route.TypedSpec().OutLinkName),
+					zap.Uint32("priority", route.TypedSpec().Priority),
+					zap.Stringer("family", route.TypedSpec().Family),
+				)
+
+				return nil
+			}
+
 			return fmt.Errorf("error adding route: %w, message %+v", err, *msg)
 		}
 
